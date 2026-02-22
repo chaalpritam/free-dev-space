@@ -4,6 +4,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
@@ -57,6 +58,18 @@ const SKIP_DIRS = new Set([".git"]);
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  let size = bytes;
+  do {
+    size /= 1024;
+    i++;
+  } while (size >= 1024 && i < units.length - 1);
+  return size.toFixed(1) + " " + units[i];
+}
+
 function parseArgs(argv) {
   const args = {
     path: null,
@@ -76,6 +89,46 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+// ─── Size Calculation ───────────────────────────────────────────────────────
+
+function getDirSize(dirPath) {
+  // Use du for speed on macOS/Linux
+  if (process.platform !== "win32") {
+    try {
+      const output = execSync(`du -sk "${dirPath}" 2>/dev/null`, {
+        encoding: "utf8",
+        timeout: 30000,
+      });
+      const kb = parseInt(output.split("\t")[0], 10);
+      if (!isNaN(kb)) return kb * 1024;
+    } catch {
+      // fall through to Node.js fallback
+    }
+  }
+
+  // Node.js fallback (Windows or if du fails)
+  let total = 0;
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      try {
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isFile()) {
+          total += fs.statSync(fullPath).size;
+        } else if (entry.isDirectory()) {
+          total += getDirSize(fullPath);
+        }
+      } catch {
+        // permission errors, broken symlinks, etc.
+      }
+    }
+  } catch {
+    // can't read directory
+  }
+  return total;
 }
 
 // ─── Scanner ────────────────────────────────────────────────────────────────
@@ -223,6 +276,48 @@ function showHelp() {
   console.log();
 }
 
+function showResults(results, rootPath, dryRun) {
+  const totalSize = results.reduce((sum, r) => sum + r.size, 0);
+
+  if (results.length === 0) {
+    console.log(`  ${c.green}✓${c.reset} No cleanable artifacts found in ${c.bold}${rootPath}${c.reset}`);
+    console.log(`  ${c.dim}Your workspace is already clean!${c.reset}`);
+    console.log();
+    return;
+  }
+
+  // Sort by size descending
+  results.sort((a, b) => b.size - a.size);
+
+  const label = dryRun
+    ? `${c.yellow}[DRY RUN]${c.reset} Would delete`
+    : "Found";
+
+  console.log(
+    `  ${label} ${c.bold}${results.length}${c.reset} artifact${results.length === 1 ? "" : "s"} totaling ${c.bold}${c.green}${formatSize(totalSize)}${c.reset}`
+  );
+  console.log();
+
+  // Calculate column widths
+  const maxNameLen = Math.max(...results.map((r) => r.name.length));
+
+  for (const r of results) {
+    const relPath = path.relative(rootPath, path.dirname(r.path));
+    const displayPath = relPath || ".";
+    const sizeStr = formatSize(r.size);
+    const padding = " ".repeat(Math.max(0, maxNameLen - r.name.length));
+    console.log(
+      `    ${c.red}${r.name}${c.reset}${padding}  ${c.bold}${sizeStr.padStart(10)}${c.reset}  ${c.dim}${displayPath}${c.reset}`
+    );
+  }
+
+  console.log();
+  console.log(
+    `  ${c.bold}Total: ${c.green}${formatSize(totalSize)}${c.reset}`
+  );
+  console.log();
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -267,11 +362,34 @@ async function main() {
   // Scan
   const results = scan(targetPath);
 
-  // TODO: calculate sizes, display results, confirm, delete
-  console.log(`  ${c.dim}Found ${results.length} artifact(s)${c.reset}`);
-  for (const r of results) {
-    console.log(`    ${c.red}${r.name}${c.reset}  ${c.dim}${r.path}${c.reset}`);
+  if (results.length === 0) {
+    showResults(results, targetPath, args.dryRun);
+    process.exit(0);
   }
+
+  // Calculate sizes (with progress)
+  const sizeSpinner = useColor
+    ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    : ["-", "\\", "|", "/"];
+
+  for (let i = 0; i < results.length; i++) {
+    if (isTTY) {
+      process.stdout.write(
+        `\r  ${c.cyan}${sizeSpinner[i % sizeSpinner.length]}${c.reset} Calculating sizes... ${c.dim}(${i + 1}/${results.length})${c.reset}`
+      );
+    }
+    results[i].size = getDirSize(results[i].path);
+  }
+
+  // Clear spinner
+  if (isTTY) {
+    process.stdout.write("\r" + " ".repeat(60) + "\r");
+  }
+
+  // Display results
+  showResults(results, targetPath, args.dryRun);
+
+  // TODO: confirm and delete
 }
 
 main().catch((err) => {
