@@ -5,6 +5,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const readline = require("readline");
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,19 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+function prompt(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase());
+    });
+  });
 }
 
 // ─── Size Calculation ───────────────────────────────────────────────────────
@@ -318,6 +332,56 @@ function showResults(results, rootPath, dryRun) {
   console.log();
 }
 
+// ─── Deletion ───────────────────────────────────────────────────────────────
+
+function deleteResults(results) {
+  const total = results.length;
+  let freed = 0;
+  let failed = 0;
+
+  for (let i = 0; i < total; i++) {
+    const r = results[i];
+    const progress = `[${i + 1}/${total}]`;
+
+    if (isTTY) {
+      process.stdout.write(
+        `\r  ${c.cyan}${progress}${c.reset} Deleting ${c.dim}${r.name}${c.reset}` +
+          " ".repeat(20)
+      );
+    }
+
+    try {
+      fs.rmSync(r.path, { recursive: true, force: true });
+      freed += r.size;
+    } catch (err) {
+      failed++;
+      if (isTTY) {
+        process.stdout.write("\r" + " ".repeat(70) + "\r");
+      }
+      console.log(
+        `  ${c.red}✗${c.reset} Failed to delete ${r.name}: ${err.message}`
+      );
+    }
+  }
+
+  // Clear progress line
+  if (isTTY) {
+    process.stdout.write("\r" + " ".repeat(70) + "\r");
+  }
+
+  console.log(
+    `  ${c.green}✓${c.reset} Deleted ${c.bold}${total - failed}${c.reset} artifact${total - failed === 1 ? "" : "s"}, freed ${c.bold}${c.green}${formatSize(freed)}${c.reset}`
+  );
+
+  if (failed > 0) {
+    console.log(
+      `  ${c.yellow}⚠${c.reset} ${failed} artifact${failed === 1 ? "" : "s"} could not be deleted`
+    );
+  }
+
+  console.log();
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -389,7 +453,31 @@ async function main() {
   // Display results
   showResults(results, targetPath, args.dryRun);
 
-  // TODO: confirm and delete
+  // Dry run stops here
+  if (args.dryRun) {
+    console.log(
+      `  ${c.dim}Run without --dry-run to delete these artifacts${c.reset}`
+    );
+    console.log();
+    process.exit(0);
+  }
+
+  // Confirm deletion
+  if (!args.yes) {
+    const answer = await prompt(
+      `  ${c.yellow}?${c.reset} Delete all ${results.length} artifact${results.length === 1 ? "" : "s"}? ${c.dim}(y/N)${c.reset} `
+    );
+    console.log();
+
+    if (answer !== "y" && answer !== "yes") {
+      console.log(`  ${c.dim}Aborted. Nothing was deleted.${c.reset}`);
+      console.log();
+      process.exit(0);
+    }
+  }
+
+  // Delete
+  deleteResults(results);
 }
 
 main().catch((err) => {
