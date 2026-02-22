@@ -28,6 +28,33 @@ const c = {
   white: useColor ? "\x1b[37m" : "",
 };
 
+// ─── Target Definitions ─────────────────────────────────────────────────────
+
+const TARGETS = [
+  { name: "node_modules", match: "direct" },
+  { name: "Pods", match: "parent", parent: "ios" },
+  { name: ".next", match: "direct" },
+  { name: ".nuxt", match: "direct" },
+  { name: ".gradle", match: "parent", parent: "android" },
+  { name: "build", match: "parentPath", parents: ["android", "app"] },
+  { name: ".cxx", match: "parentPath", parents: ["android", "app"] },
+  { name: "dist", match: "direct" },
+  { name: "vendor", match: "sibling", sibling: "Gemfile" },
+  { name: ".build", match: "direct" },
+  { name: "target", match: "sibling", sibling: "Cargo.toml" },
+  { name: "__pycache__", match: "direct" },
+  { name: ".venv", match: "direct" },
+  { name: "venv", match: "direct" },
+  { name: ".dart_tool", match: "direct" },
+  { name: ".turbo", match: "direct" },
+  { name: ".parcel-cache", match: "direct" },
+];
+
+const TARGET_NAMES = new Set(TARGETS.map((t) => t.name));
+
+// Dirs to never recurse into (besides matched targets)
+const SKIP_DIRS = new Set([".git"]);
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -49,6 +76,108 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+// ─── Scanner ────────────────────────────────────────────────────────────────
+
+function isTargetMatch(entryName, entryDir) {
+  for (const target of TARGETS) {
+    if (target.name !== entryName) continue;
+
+    const parentName = path.basename(entryDir);
+
+    switch (target.match) {
+      case "direct":
+        return true;
+
+      case "parent":
+        if (parentName === target.parent) return true;
+        break;
+
+      case "parentPath": {
+        const parts = entryDir.split(path.sep);
+        const len = parts.length;
+        if (
+          len >= 2 &&
+          parts[len - 1] === target.parents[1] &&
+          parts[len - 2] === target.parents[0]
+        ) {
+          return true;
+        }
+        break;
+      }
+
+      case "sibling": {
+        const siblingPath = path.join(entryDir, target.sibling);
+        try {
+          fs.accessSync(siblingPath, fs.constants.F_OK);
+          return true;
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function scan(rootPath) {
+  const results = [];
+  const spinner = useColor
+    ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    : ["-", "\\", "|", "/"];
+  let spinIdx = 0;
+  let scanCount = 0;
+
+  function walk(dir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      const name = entry.name;
+
+      // Skip hidden dirs we don't care about and .git
+      if (SKIP_DIRS.has(name)) continue;
+
+      const fullPath = path.join(dir, name);
+
+      if (isTargetMatch(name, dir)) {
+        results.push({ name, path: fullPath, size: 0 });
+        // Don't recurse into matched dirs
+        continue;
+      }
+
+      // Don't recurse into known target names that didn't match safety checks
+      // (they're likely still big dirs we don't want to scan inside)
+      if (TARGET_NAMES.has(name)) continue;
+
+      // Show scanning progress
+      scanCount++;
+      if (isTTY && scanCount % 50 === 0) {
+        process.stdout.write(
+          `\r  ${c.cyan}${spinner[spinIdx % spinner.length]}${c.reset} Scanning... ${c.dim}${scanCount} directories checked${c.reset}`
+        );
+        spinIdx++;
+      }
+
+      walk(fullPath);
+    }
+  }
+
+  walk(rootPath);
+
+  // Clear spinner line
+  if (isTTY && scanCount > 0) {
+    process.stdout.write("\r" + " ".repeat(60) + "\r");
+  }
+
+  return results;
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -135,8 +264,14 @@ async function main() {
   );
   console.log();
 
-  // TODO: scan, display results, confirm, delete
-  console.log(`  ${c.dim}Scanner not implemented yet${c.reset}`);
+  // Scan
+  const results = scan(targetPath);
+
+  // TODO: calculate sizes, display results, confirm, delete
+  console.log(`  ${c.dim}Found ${results.length} artifact(s)${c.reset}`);
+  for (const r of results) {
+    console.log(`    ${c.red}${r.name}${c.reset}  ${c.dim}${r.path}${c.reset}`);
+  }
 }
 
 main().catch((err) => {
