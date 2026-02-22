@@ -1,0 +1,34 @@
+{
+  "name": "free-dev-space",
+  "version": "1.0.0",
+  "description": "Instantly free up gigabytes of disk space by cleaning regenerable dev artifacts (node_modules, Pods, .gradle, build caches, and more)",
+  "main": "index.js",
+  "bin": {
+    "free-dev-space": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "disk-space",
+    "cleanup",
+    "node_modules",
+    "cache",
+    "devtools",
+    "cli",
+    "npx",
+    "free-space",
+    "clean",
+    "developer"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
