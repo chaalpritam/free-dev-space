@@ -9,7 +9,7 @@ const readline = require("readline");
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 // ─── ANSI Colors ────────────────────────────────────────────────────────────
 
@@ -76,6 +76,7 @@ function parseArgs(argv) {
     path: null,
     dryRun: false,
     yes: false,
+    noDocker: false,
     version: false,
     help: false,
   };
@@ -84,6 +85,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "-d" || arg === "--dry-run") args.dryRun = true;
     else if (arg === "-y" || arg === "--yes") args.yes = true;
+    else if (arg === "--no-docker") args.noDocker = true;
     else if (arg === "-v" || arg === "--version") args.version = true;
     else if (arg === "-h" || arg === "--help") args.help = true;
     else if (!arg.startsWith("-")) args.path = arg;
@@ -267,7 +269,8 @@ function showHelp() {
   console.log();
   console.log(`  ${c.bold}OPTIONS${c.reset}`);
   console.log(`    -d, --dry-run    Preview what would be deleted`);
-  console.log(`    -y, --yes        Skip confirmation prompt`);
+  console.log(`    -y, --yes        Skip confirmation prompts`);
+  console.log(`        --no-docker  Skip Docker scan and cleanup`);
   console.log(`    -v, --version    Show version`);
   console.log(`    -h, --help       Show help`);
   console.log();
@@ -275,6 +278,7 @@ function showHelp() {
   console.log(`    npx free-dev-space ~/dev`);
   console.log(`    npx free-dev-space . --dry-run`);
   console.log(`    npx free-dev-space ~/projects -y`);
+  console.log(`    npx free-dev-space . --no-docker`);
   console.log();
   console.log(`  ${c.bold}WHAT IT CLEANS${c.reset}`);
   console.log(
@@ -287,6 +291,11 @@ function showHelp() {
     `    .build, target (Rust), __pycache__, .venv, venv, .dart_tool,`
   );
   console.log(`    .turbo, .parcel-cache`);
+  console.log();
+  console.log(
+    `    Plus unused Docker images, containers, volumes, and build cache`
+  );
+  console.log(`    when Docker is running (skip with --no-docker).`);
   console.log();
 }
 
@@ -382,6 +391,208 @@ function deleteResults(results) {
   console.log();
 }
 
+// ─── Docker ─────────────────────────────────────────────────────────────────
+
+function checkDockerAvailable() {
+  try {
+    execSync("docker info", { stdio: "pipe", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseDockerSize(str) {
+  if (!str || typeof str !== "string") return 0;
+  // Strip optional "(NN%)" suffix from Reclaimable values like "3.6GB (66%)"
+  const cleaned = str.replace(/\s*\([^)]*\)\s*$/, "").trim();
+  const m = cleaned.match(/^([\d.]+)\s*([kKmMgGtT]?)i?[bB]?$/);
+  if (!m) return 0;
+  const num = parseFloat(m[1]);
+  const unit = m[2].toLowerCase();
+  const mults = {
+    "": 1,
+    k: 1000,
+    m: 1000 ** 2,
+    g: 1000 ** 3,
+    t: 1000 ** 4,
+  };
+  return Math.round(num * (mults[unit] || 1));
+}
+
+function getDockerUsage() {
+  try {
+    const output = execSync('docker system df --format "{{json .}}"', {
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    const rows = output
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+
+    return rows.map((r) => ({
+      type: r.Type,
+      totalCount: r.TotalCount,
+      active: r.Active,
+      sizeBytes: parseDockerSize(r.Size),
+      sizeStr: r.Size,
+      reclaimableBytes: parseDockerSize(r.Reclaimable),
+      reclaimableStr: r.Reclaimable,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function listDockerImages() {
+  try {
+    const out = execSync(
+      'docker image ls --all --format "{{json .}}"',
+      { encoding: "utf8", timeout: 10000 }
+    );
+    return out
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .map((i) => ({
+        ref: i.Repository === "<none>" ? `<none>:${i.Tag}` : `${i.Repository}:${i.Tag}`,
+        id: i.ID,
+        size: parseDockerSize(i.Size),
+        sizeStr: i.Size,
+      }))
+      .sort((a, b) => b.size - a.size);
+  } catch {
+    return [];
+  }
+}
+
+function listDockerContainers() {
+  try {
+    const out = execSync(
+      'docker ps --all --size --format "{{json .}}"',
+      { encoding: "utf8", timeout: 10000 }
+    );
+    return out
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .map((c) => {
+        // Size looks like "1.2MB (virtual 500MB)" — take the writable layer only
+        const sizeStr = (c.Size || "0B").split(" ")[0];
+        return {
+          name: c.Names,
+          image: c.Image,
+          state: c.State,
+          status: c.Status,
+          size: parseDockerSize(sizeStr),
+          sizeStr,
+        };
+      })
+      .sort((a, b) => b.size - a.size);
+  } catch {
+    return [];
+  }
+}
+
+function showDockerResults(usage, dryRun) {
+  if (!usage || usage.length === 0) return 0;
+
+  const reclaimableTotal = usage.reduce((s, u) => s + u.reclaimableBytes, 0);
+  const usedTotal = usage.reduce((s, u) => s + u.sizeBytes, 0);
+
+  const label = dryRun
+    ? `${c.yellow}[DRY RUN]${c.reset} Docker is using`
+    : "Docker is using";
+
+  console.log(
+    `  ${label} ${c.bold}${formatSize(usedTotal)}${c.reset} ${c.dim}(${c.green}${formatSize(reclaimableTotal)}${c.dim} reclaimable)${c.reset}`
+  );
+  console.log();
+
+  const typeWidth = Math.max(...usage.map((u) => u.type.length));
+  for (const u of usage) {
+    const typePad = " ".repeat(Math.max(0, typeWidth - u.type.length));
+    console.log(
+      `    ${c.blue}${u.type}${c.reset}${typePad}  ` +
+        `${c.bold}${u.sizeStr.padStart(10)}${c.reset}  ` +
+        `${c.dim}${u.totalCount} total, ${u.active} active${c.reset}  ` +
+        `${c.green}${u.reclaimableStr}${c.reset} ${c.dim}reclaimable${c.reset}`
+    );
+  }
+  console.log();
+
+  // Top images
+  const images = listDockerImages();
+  if (images.length > 0) {
+    const top = images.slice(0, 10);
+    console.log(`  ${c.bold}Top images${c.reset}`);
+    const refWidth = Math.min(50, Math.max(...top.map((i) => i.ref.length)));
+    for (const img of top) {
+      const ref = img.ref.length > 50 ? img.ref.slice(0, 47) + "..." : img.ref;
+      const pad = " ".repeat(Math.max(0, refWidth - ref.length));
+      console.log(
+        `    ${c.cyan}${ref}${c.reset}${pad}  ${c.bold}${img.sizeStr.padStart(10)}${c.reset}  ${c.dim}${img.id}${c.reset}`
+      );
+    }
+    if (images.length > top.length) {
+      console.log(
+        `    ${c.dim}… and ${images.length - top.length} more image${images.length - top.length === 1 ? "" : "s"}${c.reset}`
+      );
+    }
+    console.log();
+  }
+
+  // Containers
+  const containers = listDockerContainers();
+  if (containers.length > 0) {
+    console.log(`  ${c.bold}Containers${c.reset}`);
+    const top = containers.slice(0, 10);
+    const nameWidth = Math.min(30, Math.max(...top.map((c) => c.name.length)));
+    for (const ct of top) {
+      const name = ct.name.length > 30 ? ct.name.slice(0, 27) + "..." : ct.name;
+      const pad = " ".repeat(Math.max(0, nameWidth - name.length));
+      const stateColor = ct.state === "running" ? c.green : c.dim;
+      console.log(
+        `    ${c.cyan}${name}${c.reset}${pad}  ${c.bold}${ct.sizeStr.padStart(10)}${c.reset}  ${stateColor}${ct.state}${c.reset}  ${c.dim}${ct.image}${c.reset}`
+      );
+    }
+    if (containers.length > top.length) {
+      console.log(
+        `    ${c.dim}… and ${containers.length - top.length} more container${containers.length - top.length === 1 ? "" : "s"}${c.reset}`
+      );
+    }
+    console.log();
+  }
+
+  return reclaimableTotal;
+}
+
+function deleteDocker() {
+  console.log(
+    `  ${c.cyan}→${c.reset} ${c.dim}docker system prune --all --volumes --force${c.reset}`
+  );
+  try {
+    const output = execSync("docker system prune --all --volumes --force", {
+      encoding: "utf8",
+      timeout: 600000,
+    });
+    const m = output.match(/Total reclaimed space:\s*(.+)$/im);
+    const reclaimed = m ? m[1].trim() : "unknown amount";
+    console.log(
+      `  ${c.green}✓${c.reset} Reclaimed ${c.bold}${c.green}${reclaimed}${c.reset} from Docker`
+    );
+  } catch (err) {
+    console.log(
+      `  ${c.red}✗${c.reset} Docker cleanup failed: ${err.message.split("\n")[0]}`
+    );
+  }
+  console.log();
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -426,58 +637,105 @@ async function main() {
   // Scan
   const results = scan(targetPath);
 
-  if (results.length === 0) {
-    showResults(results, targetPath, args.dryRun);
-    process.exit(0);
-  }
-
   // Calculate sizes (with progress)
-  const sizeSpinner = useColor
-    ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-    : ["-", "\\", "|", "/"];
+  if (results.length > 0) {
+    const sizeSpinner = useColor
+      ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+      : ["-", "\\", "|", "/"];
 
-  for (let i = 0; i < results.length; i++) {
-    if (isTTY) {
-      process.stdout.write(
-        `\r  ${c.cyan}${sizeSpinner[i % sizeSpinner.length]}${c.reset} Calculating sizes... ${c.dim}(${i + 1}/${results.length})${c.reset}`
-      );
+    for (let i = 0; i < results.length; i++) {
+      if (isTTY) {
+        process.stdout.write(
+          `\r  ${c.cyan}${sizeSpinner[i % sizeSpinner.length]}${c.reset} Calculating sizes... ${c.dim}(${i + 1}/${results.length})${c.reset}`
+        );
+      }
+      results[i].size = getDirSize(results[i].path);
     }
-    results[i].size = getDirSize(results[i].path);
+
+    // Clear spinner
+    if (isTTY) {
+      process.stdout.write("\r" + " ".repeat(60) + "\r");
+    }
   }
 
-  // Clear spinner
-  if (isTTY) {
-    process.stdout.write("\r" + " ".repeat(60) + "\r");
-  }
-
-  // Display results
+  // Display file artifact results
   showResults(results, targetPath, args.dryRun);
 
-  // Dry run stops here
-  if (args.dryRun) {
+  // Confirm + delete file artifacts
+  if (results.length > 0 && !args.dryRun) {
+    let proceed = args.yes;
+    if (!proceed) {
+      const answer = await prompt(
+        `  ${c.yellow}?${c.reset} Delete all ${results.length} artifact${results.length === 1 ? "" : "s"}? ${c.dim}(y/N)${c.reset} `
+      );
+      console.log();
+      proceed = answer === "y" || answer === "yes";
+    }
+
+    if (proceed) {
+      deleteResults(results);
+    } else {
+      console.log(`  ${c.dim}Skipped file artifact deletion.${c.reset}`);
+      console.log();
+    }
+  }
+
+  // ─── Docker ──────────────────────────────────────────────────────────────
+  let dockerUsage = null;
+  if (!args.noDocker) {
+    if (isTTY) {
+      process.stdout.write(`  ${c.dim}Checking Docker...${c.reset}`);
+    }
+    if (checkDockerAvailable()) {
+      dockerUsage = getDockerUsage();
+    }
+    if (isTTY) {
+      process.stdout.write("\r" + " ".repeat(40) + "\r");
+    }
+  }
+
+  if (dockerUsage && dockerUsage.length > 0) {
+    const reclaimable = showDockerResults(dockerUsage, args.dryRun);
+
+    if (!args.dryRun) {
+      if (reclaimable <= 0) {
+        console.log(
+          `  ${c.green}✓${c.reset} Nothing to reclaim from Docker.`
+        );
+        console.log();
+      } else {
+        let proceed = args.yes;
+        if (!proceed) {
+          console.log(
+            `  ${c.dim}This removes all stopped containers, all images not in use by a${c.reset}`
+          );
+          console.log(
+            `  ${c.dim}running container, all unused volumes, and all build cache.${c.reset}`
+          );
+          const answer = await prompt(
+            `  ${c.yellow}?${c.reset} Run ${c.bold}docker system prune --all --volumes${c.reset} to free ~${c.bold}${c.green}${formatSize(reclaimable)}${c.reset}? ${c.dim}(y/N)${c.reset} `
+          );
+          console.log();
+          proceed = answer === "y" || answer === "yes";
+        }
+
+        if (proceed) {
+          deleteDocker();
+        } else {
+          console.log(`  ${c.dim}Skipped Docker cleanup.${c.reset}`);
+          console.log();
+        }
+      }
+    }
+  }
+
+  // Dry run reminder at the very end if nothing was deleted
+  if (args.dryRun && (results.length > 0 || (dockerUsage && dockerUsage.length > 0))) {
     console.log(
       `  ${c.dim}Run without --dry-run to delete these artifacts${c.reset}`
     );
     console.log();
-    process.exit(0);
   }
-
-  // Confirm deletion
-  if (!args.yes) {
-    const answer = await prompt(
-      `  ${c.yellow}?${c.reset} Delete all ${results.length} artifact${results.length === 1 ? "" : "s"}? ${c.dim}(y/N)${c.reset} `
-    );
-    console.log();
-
-    if (answer !== "y" && answer !== "yes") {
-      console.log(`  ${c.dim}Aborted. Nothing was deleted.${c.reset}`);
-      console.log();
-      process.exit(0);
-    }
-  }
-
-  // Delete
-  deleteResults(results);
 }
 
 main().catch((err) => {
