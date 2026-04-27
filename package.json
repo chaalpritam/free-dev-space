@@ -1,6 +1,6 @@
 {
   "name": "free-dev-space",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Instantly free up gigabytes of disk space by cleaning regenerable dev artifacts (node_modules, Pods, .gradle, build caches, and more)",
   "main": "index.js",
   "bin": {
